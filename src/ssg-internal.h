@@ -65,16 +65,14 @@ extern "C" {
     ABT_mutex_unlock(__gd->ref_mutex); \
 } while(0)
 
-#define SSG_GROUP_REF_DECR(__gd) do { \
-    ABT_mutex_lock(__gd->ref_mutex); \
-    __gd->ref_count--; \
-    ABT_cond_signal(__gd->ref_cond); \
-    ABT_mutex_unlock(__gd->ref_mutex); \
-} while(0)
+/* Dropping a reference can be what frees the group -- see
+ * ssg_group_ref_decr() in ssg.c. Kept as a macro so the existing call sites
+ * are untouched. */
+#define SSG_GROUP_REF_DECR(__gd) ssg_group_ref_decr(__gd)
 
 #define SSG_GROUP_REFS_WAIT(__gd) do { \
     ABT_mutex_lock(__gd->ref_mutex); \
-    while(gd->ref_count) ABT_cond_wait(__gd->ref_cond, __gd->ref_mutex); \
+    while(__gd->ref_count) ABT_cond_wait(__gd->ref_cond, __gd->ref_mutex); \
     ABT_mutex_unlock(__gd->ref_mutex); \
 } while(0)
 
@@ -155,6 +153,7 @@ typedef struct ssg_group_descriptor
     ABT_mutex ref_mutex;
     ABT_cond ref_cond;
     int ref_count;
+    int group_dying;    /* retired; free `group` when the last reference drops */
     UT_hash_handle hh;
 } ssg_group_descriptor_t;
 
@@ -290,6 +289,12 @@ int ssg_group_refresh_send(
     ssg_mid_state_t * mid_state,
     int * group_size,
     void ** view_buf);
+/* Drop a group reference, freeing the group if this was the last one and the
+ * group has been retired. Defined in ssg.c, where ssg_group_destroy_internal()
+ * lives. */
+void ssg_group_ref_decr(
+    ssg_group_descriptor_t *gd);
+
 int ssg_apply_member_updates(
     ssg_group_descriptor_t  * gd,
     ssg_member_update_t * updates,

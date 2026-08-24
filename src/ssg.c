@@ -2690,8 +2690,12 @@ static int ssg_group_leave_internal(
     /* prevent important view data from being destroyed */
     gd->group->view.member_map = NULL;
     gd->group->view.rank_array = NULL;
-    ssg_group_destroy_internal(gd->group, gd->mid_state);
-    gd->group = NULL;
+    /* Retire rather than free. Clearing is_member makes SWIM recv ULTs bail
+     * at their existing membership check, and the group is released by
+     * whichever context drops the last reference (ssg_group_ref_decr()).
+     * Freeing here would pull it out from under a ULT that has released
+     * gd->lock but still holds a reference. */
+    gd->group_dying = 1;
     gd->is_member = 0;
     ABT_rwlock_unlock(gd->lock);
 
@@ -3015,6 +3019,56 @@ static ssg_group_descriptor_t * ssg_group_descriptor_create(
     ABT_cond_create(&descriptor->ref_cond);
 
     return descriptor;
+}
+
+/* Drop a group reference, and free the group if this was the last one and the
+ * group has been retired.
+ *
+ * This is what makes the reference count actually own the group. Previously
+ * two teardown paths freed `gd->group` inline and nulled it while a SWIM recv
+ * ULT that had released gd->lock -- but still held a reference -- was walking
+ * that same group, crashing in swim_apply_member_updates() (issues #62, #74).
+ * ssg_group_destroy() was already correct because it drains references first;
+ * the other two were not, and one of them (self-eviction in
+ * ssg_apply_member_updates()) runs inside a ULT holding a reference and so
+ * cannot drain without waiting on itself.
+ *
+ * The reclaim is deliberately performed OUTSIDE ref_mutex. ref_mutex is a leaf
+ * lock; taking gd->lock underneath it would invert the established
+ * ssg_rt->lock -> gd->lock -> swim_lock ordering and deadlock against the
+ * update paths in swim-fd.c that take gd->lock for write.
+ */
+void
+ssg_group_ref_decr(ssg_group_descriptor_t *gd)
+{
+    int reclaim = 0;
+
+    ABT_mutex_lock(gd->ref_mutex);
+    gd->ref_count--;
+    if (gd->ref_count == 0 && gd->group_dying && gd->group)
+        reclaim = 1;
+    ABT_cond_signal(gd->ref_cond);
+    ABT_mutex_unlock(gd->ref_mutex);
+
+    if (reclaim)
+    {
+        ssg_group_state_t *doomed = NULL;
+
+        ABT_rwlock_wrlock(gd->lock);
+        /* Re-check under the lock: a concurrent ssg_group_destroy() may have
+         * drained and freed it between the unlock above and here. */
+        if (gd->group_dying && gd->group)
+        {
+            doomed = gd->group;
+            gd->group = NULL;
+        }
+        ABT_rwlock_unlock(gd->lock);
+
+        if (doomed)
+            ssg_group_destroy_internal(doomed, gd->mid_state);
+    }
+
+    return;
 }
 
 static void ssg_group_destroy_internal(
@@ -3452,6 +3506,25 @@ int ssg_apply_member_updates(
             /* XXX refactor this code path -- nearly same as ssg_group_leave_internal */
             ssg_group_view_t *new_view;
             int self_rank;
+            int already_retired;
+
+            /* Bail if this group has already been torn down -- by
+             * ssg_group_leave_internal(), or by a previous trip through this
+             * same branch on another SWIM ULT. Nothing here is idempotent:
+             * it finalizes SWIM, rewrites gd->view, and steals the group's
+             * member_map/rank_array, so a second pass reads state the first
+             * pass already dismantled.
+             *
+             * The old code had no such guard because it set gd->group = NULL
+             * on the way out, and a second pass then died dereferencing it --
+             * which is issue #62. Now that the group outlives teardown until
+             * the last reference drops, the re-entrancy has to be refused
+             * explicitly rather than by crashing. */
+            ABT_rwlock_rdlock(gd->lock);
+            already_retired = (gd->group_dying || !gd->is_member || !gd->group);
+            ABT_rwlock_unlock(gd->lock);
+            if (already_retired)
+                return SSG_ERR_SELF_FAILED;
 
             new_view = malloc(sizeof(*new_view));
             if (!new_view)
@@ -3479,8 +3552,11 @@ int ssg_apply_member_updates(
             /* prevent important view data from being destroyed */
             gd->group->view.member_map = NULL;
             gd->group->view.rank_array = NULL;
-            ssg_group_destroy_internal(gd->group, gd->mid_state);
-            gd->group = NULL;
+            /* Retire rather than free -- see ssg_group_leave_internal().
+             * This path is why the deferred scheme is needed at all: it runs
+             * inside a SWIM ULT that is itself holding a reference, so it
+             * cannot drain references without waiting on itself. */
+            gd->group_dying = 1;
             gd->is_member = 0;
             ABT_rwlock_unlock(gd->lock);
 
