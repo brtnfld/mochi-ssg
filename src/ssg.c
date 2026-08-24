@@ -2668,6 +2668,29 @@ static int ssg_group_leave_internal(
     SSG_GROUP_REF_INCR(gd);
     SSG_GROUP_RELEASE(gd);
 
+    /* Refuse if this group has already been torn down -- by a SWIM ULT
+     * self-evicting in ssg_apply_member_updates(), or by an earlier leave.
+     * The teardown below is not idempotent: it finalizes SWIM, rewrites
+     * gd->view and steals the group's member_map/rank_array, so a second
+     * pass reads state the first pass already dismantled.
+     *
+     * Claim exclusive teardown rights BEFORE any unlocked work. swim_finalize()
+     * below runs with gd->lock released, and it is not safe to call twice --
+     * two threads that both passed a mere check would double-finalize and
+     * corrupt the heap ("malloc(): unaligned tcache chunk detected"). Setting
+     * group_dying here, under the write lock, makes the claim atomic: whoever
+     * sets it owns the teardown, and everyone else bails. */
+    ABT_rwlock_wrlock(gd->lock);
+    if (gd->group_dying || !gd->is_member || !gd->group)
+    {
+        ABT_rwlock_unlock(gd->lock);
+        SSG_GROUP_REF_DECR(gd);
+        free(new_view);
+        return SSG_SUCCESS;
+    }
+    gd->group_dying = 1;
+    ABT_rwlock_unlock(gd->lock);
+
     /* XXX we can't just rely on ssg_group_destroy_internal, because that
      * function doesn't use locking and expects the group to no longer be
      * visible. we need to explicitly shutdown SWIM with locks released
@@ -2695,7 +2718,6 @@ static int ssg_group_leave_internal(
      * whichever context drops the last reference (ssg_group_ref_decr()).
      * Freeing here would pull it out from under a ULT that has released
      * gd->lock but still holds a reference. */
-    gd->group_dying = 1;
     gd->is_member = 0;
     ABT_rwlock_unlock(gd->lock);
 
@@ -3520,11 +3542,16 @@ int ssg_apply_member_updates(
              * which is issue #62. Now that the group outlives teardown until
              * the last reference drops, the re-entrancy has to be refused
              * explicitly rather than by crashing. */
-            ABT_rwlock_rdlock(gd->lock);
+            ABT_rwlock_wrlock(gd->lock);
             already_retired = (gd->group_dying || !gd->is_member || !gd->group);
-            ABT_rwlock_unlock(gd->lock);
             if (already_retired)
+            {
+                ABT_rwlock_unlock(gd->lock);
+                free(new_view);
                 return SSG_ERR_SELF_FAILED;
+            }
+            gd->group_dying = 1;
+            ABT_rwlock_unlock(gd->lock);
 
             new_view = malloc(sizeof(*new_view));
             if (!new_view)
@@ -3556,7 +3583,6 @@ int ssg_apply_member_updates(
              * This path is why the deferred scheme is needed at all: it runs
              * inside a SWIM ULT that is itself holding a reference, so it
              * cannot drain references without waiting on itself. */
-            gd->group_dying = 1;
             gd->is_member = 0;
             ABT_rwlock_unlock(gd->lock);
 

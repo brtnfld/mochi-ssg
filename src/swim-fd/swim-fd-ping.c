@@ -124,18 +124,44 @@ void swim_dping_req_send_ult(
     hg_handle_t handle;
     hg_return_t hret;
 
-    if (!gd || !gd->group || !gd->group->swim_ctx)
+    if (!gd)
     {
         margo_error(MARGO_INSTANCE_NULL,
             "[ssg] SWIM dping req send error: invalid group state");
         return;
     }
+    /* Take a reference for the duration, and refuse a retired group.
+     *
+     * This path previously took neither a lock nor a reference: it tested
+     * gd->group for NULL and went ahead. That was only ever safe because
+     * teardown NULLed gd->group promptly -- which is the very thing that
+     * crashed the *recv* path. Now that the group outlives teardown until
+     * the last reference drops, an unreferenced reader here would happily
+     * pack a message out of state that teardown has already dismantled,
+     * strdup()ing an address string that has been freed.
+     *
+     * group_dying is the authoritative "stop" flag and is set under gd->lock
+     * before any dismantling begins, so observing it clear while holding the
+     * lock, and taking a reference before releasing, is sufficient. */
+    ABT_rwlock_rdlock(gd->lock);
+    if (!gd->group || gd->group_dying || !gd->group->swim_ctx)
+    {
+        ABT_rwlock_unlock(gd->lock);
+        margo_error(MARGO_INSTANCE_NULL,
+            "[ssg] SWIM dping req send error: invalid group state");
+        return;
+    }
+    SSG_GROUP_REF_INCR(gd);
+    ABT_rwlock_unlock(gd->lock);
     swim_ctx = gd->group->swim_ctx;
 
     hret = margo_create(gd->mid_state->mid, swim_ctx->dping_target_addr,
         gd->mid_state->swim_dping_req_rpc_id, &handle);
     if(hret != HG_SUCCESS)
+    {
+        SSG_GROUP_REF_DECR(gd);
         return;
+    }
 
     SSG_DEBUG(gd->mid_state, "SWIM: send dping req to %lu (seq_nr=%u)\n",
         swim_ctx->dping_target_id, swim_ctx->seq_nr);
@@ -152,6 +178,7 @@ void swim_dping_req_send_ult(
 
     swim_free_packed_message(&(dping_req.msg));
     margo_destroy(handle);
+    SSG_GROUP_REF_DECR(gd);
     return;
 }
 
@@ -405,12 +432,25 @@ void swim_iping_req_send_ult(
     swim_iping_req_t iping_req;
     hg_return_t hret;
 
-    if (!gd || !gd->group || !gd->group->swim_ctx)
+    if (!gd)
     {
         margo_error(MARGO_INSTANCE_NULL,
             "[ssg] SWIM iping req send error: invalid group state");
         return;
     }
+    /* Reference + retired check, for the same reason as the dping send path
+     * above: an unreferenced reader would pack a message out of state that
+     * teardown has already dismantled. */
+    ABT_rwlock_rdlock(gd->lock);
+    if (!gd->group || gd->group_dying || !gd->group->swim_ctx)
+    {
+        ABT_rwlock_unlock(gd->lock);
+        margo_error(MARGO_INSTANCE_NULL,
+            "[ssg] SWIM iping req send error: invalid group state");
+        return;
+    }
+    SSG_GROUP_REF_INCR(gd);
+    ABT_rwlock_unlock(gd->lock);
     swim_ctx = gd->group->swim_ctx;
 
     ABT_rwlock_wrlock(swim_ctx->swim_lock);
@@ -422,7 +462,10 @@ void swim_iping_req_send_ult(
     hret = margo_create(gd->mid_state->mid, iping_target_addr,
         gd->mid_state->swim_iping_req_rpc_id, &handle);
     if(hret != HG_SUCCESS)
+    {
+        SSG_GROUP_REF_DECR(gd);
         return;
+    }
 
     SSG_DEBUG(gd->mid_state, "SWIM: send iping req to %lu (target=%lu, seq_nr=%u)\n",
         iping_target_id, swim_ctx->dping_target_id, swim_ctx->seq_nr);
@@ -439,6 +482,7 @@ void swim_iping_req_send_ult(
 
     swim_free_packed_message(&(iping_req.msg));
     margo_destroy(handle);
+    SSG_GROUP_REF_DECR(gd);
     return;
 }
 
