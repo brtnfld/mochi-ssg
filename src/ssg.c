@@ -3067,9 +3067,21 @@ ssg_group_ref_decr(ssg_group_descriptor_t *gd)
 
     ABT_mutex_lock(gd->ref_mutex);
     gd->ref_count--;
-    if (gd->ref_count == 0 && gd->group_dying && gd->group)
+    /* Only ref_count is examined here, because only ref_count is guarded by
+     * ref_mutex. group_dying and gd->group belong to gd->lock, and reading
+     * them under the wrong lock would be a data race whose failure mode is a
+     * missed reclaim -- i.e. a silent leak -- if a stale group_dying == 0
+     * were observed. The authoritative test is made below, under gd->lock;
+     * this is only deciding whether it is worth taking that lock at all, and
+     * ref_count reaching zero is rare enough that the extra acquisition
+     * costs nothing. */
+    if (gd->ref_count == 0)
         reclaim = 1;
-    ABT_cond_signal(gd->ref_cond);
+    /* Broadcast, not signal: SSG_GROUP_REFS_WAIT() can have more than one
+     * waiter (ssg_finalize() walks every group, ssg_group_destroy() waits on
+     * one), and waking only one of them at the zero transition would leave
+     * the others parked forever. */
+    ABT_cond_broadcast(gd->ref_cond);
     ABT_mutex_unlock(gd->ref_mutex);
 
     if (reclaim)
@@ -3547,7 +3559,8 @@ int ssg_apply_member_updates(
             if (already_retired)
             {
                 ABT_rwlock_unlock(gd->lock);
-                free(new_view);
+                /* Nothing allocated yet on this path -- new_view is malloc'd
+                 * below, after the claim succeeds. */
                 return SSG_ERR_SELF_FAILED;
             }
             gd->group_dying = 1;
